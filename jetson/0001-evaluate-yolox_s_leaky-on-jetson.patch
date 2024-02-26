@@ -1,0 +1,473 @@
+From 9a329eb627689d680bec69546270fbf329915f17 Mon Sep 17 00:00:00 2001
+From: Yasuhiro Nitta <lp6m2014@gmail.com>
+Date: Mon, 26 Feb 2024 19:46:38 +0900
+Subject: [PATCH] evaluate yolox_s_leaky on jetson
+
+---
+ detection/calibrator.py   |  4 +--
+ detection/demo_onnx.py    | 74 +++++++++++++++++++++++++++++----------
+ detection/demo_trt.py     | 62 ++++++++++++++++++++++----------
+ detection/quantization.py |  4 +--
+ detection/sample.py       |  2 +-
+ detection/server.py       | 66 ++++++++++++++++++++++++++++++++++
+ detection/util_trt.py     | 18 +++++-----
+ 7 files changed, 180 insertions(+), 50 deletions(-)
+ create mode 100644 detection/server.py
+
+diff --git a/detection/calibrator.py b/detection/calibrator.py
+index ca885d2..336e3a4 100644
+--- a/detection/calibrator.py
++++ b/detection/calibrator.py
+@@ -19,9 +19,9 @@ ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_cha
+ #IInt8LegacyCalibrator
+ #IInt8EntropyCalibrator
+ #IInt8MinMaxCalibrator
+-class Calibrator(trt.IInt8EntropyCalibrator):
++class Calibrator(trt.IInt8MinMaxCalibrator):
+     def __init__(self, stream, cache_file=""):
+-        trt.IInt8EntropyCalibrator.__init__(self)       
++        trt.IInt8MinMaxCalibrator.__init__(self)       
+         self.stream = stream
+         self.d_input = cuda.mem_alloc(self.stream.calibration_data.nbytes)
+         self.cache_file = cache_file
+diff --git a/detection/demo_onnx.py b/detection/demo_onnx.py
+index 737f478..f8c661f 100644
+--- a/detection/demo_onnx.py
++++ b/detection/demo_onnx.py
+@@ -6,16 +6,38 @@ import os
+ import cv2
+ import numpy as np
+ import onnxruntime
+-import timeit
++import time
++
++def get_provider(mode:str, use_cache: bool):
++    opt = {}
++    if mode == 'cpu':
++        return [('CPUExecutionProvider', opt)]
++    elif mode == 'cuda':
++        return [('CUDAExecutionProvider', opt)]
++    elif 'trt' in mode:
++        if use_cache:
++            cache_path = f"./{mode}"
++            opt['trt_engine_cache_path'] = cache_path
++            opt['trt_engine_cache_enable'] = True
++            os.makedirs(cache_path, exist_ok=True)
++        if 'fp16' in mode:
++            opt['trt_fp16_enable'] = True
++        return [('TensorrtExecutionProvider', opt)]
+ 
+ class YoloXDection:
+-    def __init__(self, model_path, debug = False):
++    def __init__(self, provider, model_path, warmup:bool, debug = False, visualize=True, nms_thr=0.45, score_thr=0.4, input_shape=(640, 640)):
+         so = onnxruntime.SessionOptions()
+         so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL # ORT_ENABLE_EXTENDED ORT_ENABLE_ALL
+         so.intra_op_num_threads = 4
+         so.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL # ORT_PARALLEL ORT_SEQUENTIAL
+-        self.ort_session = onnxruntime.InferenceSession(model_path, sess_options=so)  
++        self.ort_session = onnxruntime.InferenceSession(model_path, providers=provider, sess_options=so)  
+         self.device = 'cuda' 
++        self.visualize = visualize
++        self.nms_thr = nms_thr
++        self.score_thr = score_thr
++        self.input_shape = input_shape
++        self.warmup = warmup
++
+         
+     def set_labels(self, label_list_file):
+         self.class_names = []
+@@ -90,7 +112,7 @@ class YoloXDection:
+         padded_img[: int(img.shape[0] * r), : int(img.shape[1] * r)] = resized_img
+ 
+         padded_img = padded_img[:, :, ::-1]
+-        padded_img /= 255.0
++        # padded_img /= 255.0
+         if mean is not None:
+             padded_img -= mean
+         if std is not None:
+@@ -151,15 +173,19 @@ class YoloXDection:
+     def forward(self, origin_img):
+         mean = None #(0.485, 0.456, 0.406)
+         std = None #(0.229, 0.224, 0.225)
+-        input_shape = tuple(map(int, args.input_shape.split(',')))
+-        
++        input_shape = self.input_shape
++        if self.warmup:
++            img, ratio = self.preprocess(origin_img, input_shape, mean, std)
++            ort_inputs = {self.ort_session.get_inputs()[0].name: img[None, :, :, :]}
++            self.ort_session.run(None, ort_inputs)
++        t1 = time.time()
+         img, ratio = self.preprocess(origin_img, input_shape, mean, std)
++        t2 = time.time()
+         #img = img.astype(np.float16)
+         
+-        t = timeit.default_timer()
+         ort_inputs = {self.ort_session.get_inputs()[0].name: img[None, :, :, :]}
+         output = self.ort_session.run(None, ort_inputs)
+-        print('time:',timeit.default_timer()-t)
++        t3 = time.time()
+ 
+         predictions = self.demo_postprocess(output[0], input_shape)[0]
+ 
+@@ -173,33 +199,45 @@ class YoloXDection:
+         boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3]/2.
+         boxes_xyxy /= ratio
+ 
+-        dets = self.multiclass_nms(boxes_xyxy.astype(np.float32), scores, nms_thr=0.65, score_thr=0.1)
+-        
+-        dets_list = []
++        dets = self.multiclass_nms(boxes_xyxy.astype(np.float32), scores, nms_thr=self.nms_thr, score_thr=self.score_thr)
++        t4 = time.time()
++        print("preprocess", t2-t1)
++        print("infer", t3-t2)
++        print("postprocess", t4-t3)
++        print("all", t4-t1)
++        print("FPS", 1/(t4-t1))
++        final_boxes = []
++        final_scores = []
++        final_cls_inds = []
+         if dets is not None:
+             final_boxes, final_scores, final_cls_inds = dets[:, :4], dets[:, 4], dets[:, 5]
+-            origin_img, dets_list = self.vis(origin_img, final_boxes, final_scores, final_cls_inds,
+-                            conf=0.4, class_names=self.class_names)
+-        return origin_img, dets_list
++            if self.visualize:
++                origin_img, _ = self.vis(origin_img, final_boxes, final_scores, final_cls_inds,
++                                conf=self.score_thr, class_names=self.class_names)
++        return origin_img, final_boxes, final_scores, final_cls_inds
+         
+ if __name__ == '__main__':
+     parser = argparse.ArgumentParser("ONNX Demo")
++    parser.add_argument('--mode', choices=['trt', 'trt_fp16', 'cpu', 'cuda'])
++    parser.add_argument('--use-cache', action='store_true')
+     parser.add_argument('--model_path', type=str, default=None, help='model path')
+     parser.add_argument('--label_name_path', type=str, default=None, help='label_name_path')
+     parser.add_argument('--input_shape', type=str, default="640,640", help='input shape')
+     parser.add_argument('--image_path', type=str, default=None, help='image path')
+     parser.add_argument('--output_path', type=str, default=None, help='output path')
++    parser.add_argument('--warmup', action='store_true')
+     args = parser.parse_args() 
+     
+-    detection = YoloXDection(args.model_path)
++    provider = get_provider(args.mode, args.use_cache)
++    detection = YoloXDection(provider, args.model_path, args.warmup)
+     detection.set_labels(args.label_name_path)
+ 
+     origin_img = cv2.imread(args.image_path)   
+-    output_img, dets_list = detection.forward(origin_img) 
++    output_img, final_boxes, final_scores, final_cls_inds = detection.forward(origin_img) 
+     
+     # show rect     
+-    if len(dets_list) > 0:
+-        print(dets_list)
++    if len(final_boxes) > 0:
++        print(final_boxes)
+         cv2.imwrite(args.output_path, output_img)
+         print("Put rect on output.jpg")
+     else:
+diff --git a/detection/demo_trt.py b/detection/demo_trt.py
+index 4b87f36..e713d2c 100644
+--- a/detection/demo_trt.py
++++ b/detection/demo_trt.py
+@@ -6,14 +6,28 @@ import argparse
+ import cv2 as cv
+ import cv2
+ import numpy as np
+-import timeit
++import time
+ 
+ import tensorrt as trt
+ import pycuda.driver as cuda
+ import pycuda.autoinit
+ 
++# use np.bool_ instead of np.bool because deprecated
++def nptype(trt_type):
++    mapping = {
++        trt.float32: np.float32,
++        trt.float16: np.float16,
++        trt.int8: np.int8,
++        trt.int32: np.int32,
++        trt.bool: np.bool_,
++        trt.uint8: np.uint8,
++    }
++    if trt_type in mapping:
++        return mapping[trt_type]
++    raise TypeError("Could not resolve TensorRT datatype to an equivalent numpy datatype.")
++
+ class YoloXDetectorTrt:
+-    def __init__(self, engine_path):
++    def __init__(self, engine_path, visualize=True, nms_thr=0.45, score_thr=0.4):
+         # Load TRT engine
+         self.logger = trt.Logger(trt.Logger.ERROR)
+         with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
+@@ -35,14 +49,14 @@ class YoloXDetectorTrt:
+             shape = self.engine.get_binding_shape(i)
+             if is_input:
+                 self.batch_size = shape[0]
+-            size = np.dtype(trt.nptype(dtype)).itemsize
++            size = np.dtype(nptype(dtype)).itemsize
+             for s in shape:
+                 size *= s
+             allocation = cuda.mem_alloc(size)
+             binding = {
+                 'index': i,
+                 'name': name,
+-                'dtype': np.dtype(trt.nptype(dtype)),
++                'dtype': np.dtype(nptype(dtype)),
+                 'shape': list(shape),
+                 'allocation': allocation,
+             }
+@@ -69,14 +83,17 @@ class YoloXDetectorTrt:
+ 
+         self.num_classes = self.outputs[0]['shape'][-1]-5
+         
+-        self.mean = (0.485, 0.456, 0.406)
+-        self.std = (0.229, 0.224, 0.225)
++        self.mean = None
++        self.std = None
+         
+         self.strides = [8, 16, 32]
+         
+         self.labels = []
+-        self.score_threshold = 0.4
+-        self.nms_threshold = 0.4
++        self.labels = []
++        self.visualize = visualize
++        self.nms_thr = nms_thr
++        self.score_thr = score_thr
++
+     def set_labels(self, label_list_file):
+         self.labels = []
+         fptr = open(label_list_file)
+@@ -84,7 +101,7 @@ class YoloXDetectorTrt:
+             self.labels.append(line.strip())
+ 
+ 
+-    def preproc(self, img, input_size, swap=(2, 0, 1)):
++    def preproc(self, image, input_size, swap=(2, 0, 1)):
+         if len(image.shape) == 3:
+             padded_img = np.ones((input_size[0], input_size[1], 3)) * 114.0
+         else:
+@@ -99,7 +116,6 @@ class YoloXDetectorTrt:
+         padded_img[: int(img.shape[0] * r), : int(img.shape[1] * r)] = resized_img
+         padded_img = padded_img[:, :, ::-1]
+     
+-        padded_img /= 255.0
+         if self.mean is not None:
+             padded_img -= self.mean
+         if self.std is not None:
+@@ -222,11 +238,12 @@ class YoloXDetectorTrt:
+     def forward(self, src):
+         origin_img = src
+         input_shape = (640, 640)
++        t1 = time.time()
+         img, ratio = self.preproc(origin_img, input_shape)
++        t2 = time.time()
+ 
+         input_image = np.ascontiguousarray(img)
+ 
+-        t = timeit.default_timer()
+         cuda.memcpy_htod(self.inputs[0]['allocation'], input_image)
+         self.context.execute_v2(self.allocations)   
+         
+@@ -236,8 +253,7 @@ class YoloXDetectorTrt:
+             cuda.memcpy_dtoh(output, out['allocation'])
+             outputs.append(output)
+         
+-        print('infer time:',timeit.default_timer()-t)
+-
++        t3 = time.time()
+         predictions = self.demo_postprocess(outputs[0], input_shape)[0]
+ 
+         boxes = predictions[:, :4]
+@@ -249,13 +265,23 @@ class YoloXDetectorTrt:
+         boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2]/2.
+         boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3]/2.
+         boxes_xyxy /= ratio
+-        dets = self.multiclass_nms(boxes_xyxy, scores, nms_thr=0.65, score_thr=0.1)
++        final_boxes = []
++        final_scores = []
++        final_cls_inds = []
++        dets = self.multiclass_nms(boxes_xyxy, scores, nms_thr=self.nms_thr, score_thr=self.score_thr)
++        t4 = time.time()
++        print("preprocess", t2-t1)
++        print("infer", t3-t2)
++        print("postprocess", t4-t3)
++        print("all", t4-t1)
++        print("FPS", 1/(t4-t1))
+         if dets is not None:
+             final_boxes, final_scores, final_cls_inds = dets[:, :4], dets[:, 4], dets[:, 5]
+-            origin_img = self.vis(origin_img, final_boxes, final_scores, final_cls_inds,
+-                            conf=0.4, class_names=self.labels)
++            if self.visualize:
++                origin_img = self.vis(origin_img, final_boxes, final_scores, final_cls_inds,
++                                conf=self.score_thr, class_names=self.labels)
+ 
+-        return  origin_img
++        return  origin_img, final_boxes, final_scores, final_cls_inds
+     
+ 
+ if __name__ == "__main__":
+@@ -273,7 +299,7 @@ if __name__ == "__main__":
+ 
+     infer.set_labels(args.label_name_path)
+     #
+-    drawed = infer.forward(image)
++    drawed, _, _, _ = infer.forward(image)
+     cv.imwrite(args.output_path, drawed)
+ 
+ 
+diff --git a/detection/quantization.py b/detection/quantization.py
+index d03263d..2813f62 100644
+--- a/detection/quantization.py
++++ b/detection/quantization.py
+@@ -9,13 +9,13 @@ BATCH = 100
+ height = 640
+ width = 640
+ CALIB_IMG_DIR = './calibration/'
+-onnx_model_path = './yolox_s.onnx'
++onnx_model_path = './yolox_s_leaky.onnx'
+ 
+ def preprocess(img):
+     img = cv2.resize(img, (height, width))
+     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+     img = img.transpose((2, 0, 1)).astype(np.float32)
+-    img /= 255.0
++    # img /= 255.0
+     return img
+ 
+ class DataLoader:
+diff --git a/detection/sample.py b/detection/sample.py
+index cb05b0e..f218218 100644
+--- a/detection/sample.py
++++ b/detection/sample.py
+@@ -12,7 +12,7 @@ def sample(traing_data_path, count, calibration_path):
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+-    parser.add_argument('--traing_data_path', type=str, default=None, help='traing data path')
++    parser.add_argument('--training_data_path', type=str, default=None, help='training data path')
+     parser.add_argument('--count', type=int, default=2000, help='calibration data count')
+     parser.add_argument('--calibration_path', type=str, default="./calibration/", help='save calibration image path')
+     args = parser.parse_args()
+diff --git a/detection/server.py b/detection/server.py
+new file mode 100644
+index 0000000..b72f011
+--- /dev/null
++++ b/detection/server.py
+@@ -0,0 +1,66 @@
++import argparse
++import cv2
++import numpy as np
++
++import onnxruntime
++from flask import Flask, request, jsonify
++from demo_onnx import YoloXDection, get_provider
++from demo_trt import YoloXDetectorTrt
++import pycuda.driver as cuda
++import pycuda.autoinit
++
++detector = None
++app = Flask(__name__)
++
++coco80_to_91class_map = [
++    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
++    22, 23, 24, 25, 27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++    43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
++    62, 63, 64, 65, 67, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 84,
++    85, 86, 87, 88, 89, 90
++]
++
++def get_coco91_from_coco80(idx):
++    return coco80_to_91class_map[idx]
++
++@app.route('/predict', methods=['POST'])
++def predict():
++    global detector
++    print(detector)
++    if 'image' not in request.files:
++        return jsonify({'error': 'No image file'}), 400
++    if 'image_id' in request.form:
++        image_id = int(request.form['image_id'])
++    else:
++        return jsonify({'error': 'No image_id provided'}), 400
++    file_stream = request.files['image']
++    image = cv2.imdecode(np.frombuffer(file_stream.read(), np.uint8), cv2.IMREAD_COLOR)
++    _, final_boxes, final_scores, final_cls_inds = detector.forward(image)
++    results = []
++    for bbox, score, cls in zip(final_boxes, final_scores, final_cls_inds):
++        x1, y1, x2, y2 = bbox
++        result = {
++            'image_id': image_id,
++            'bbox': [x1, y1, x2-x1, y2-y1],
++            'score': float(score),
++            'category_id': get_coco91_from_coco80(int(cls))
++        }
++        results.append(result)
++
++    return jsonify(results)
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser('YoloX onnxruntime demo')
++    parser.add_argument('--mode', choices=['trt', 'trt_fp16', 'trt_int8'])
++    parser.add_argument('--model_path', type=str, default=None, help='model path')
++    args = parser.parse_args()
++    if 'int8' in args.mode:
++        detector = YoloXDetectorTrt(args.model_path, visualize=False, nms_thr=0.45, score_thr=0.1)
++    else:
++        provider = get_provider(args.mode, use_cache=False)
++        detector = YoloXDection(provider, args.model_path, visualize=False, nms_thr=0.45, score_thr=0.1)
++        # warmup
++        detector.forward(cv2.imread("dog.jpg"))
++    print("server start")
++    app.run(threaded=False, debug=True, host='0.0.0.0', use_reloader=False)
++
+diff --git a/detection/util_trt.py b/detection/util_trt.py
+index 14eb1c2..13cca56 100644
+--- a/detection/util_trt.py
++++ b/detection/util_trt.py
+@@ -2,8 +2,6 @@
+ 
+ import os
+ import tensorrt as trt
+-import pycuda.autoinit
+-import pycuda.driver as cuda
+ from calibrator import Calibrator
+ from torch.autograd import Variable
+ import torch
+@@ -19,7 +17,8 @@ def get_engine(max_batch_size=1, onnx_file_path="", engine_file_path="",\
+     """Attempts to load a serialized engine if available, otherwise builds a new TensorRT engine and saves it."""
+     def build_engine(max_batch_size, save_engine):
+         """Takes an ONNX file and creates a TensorRT engine to run inference with"""
+-        with trt.Builder(TRT_LOGGER) as builder, \
++        # with trt.Builder(TRT_LOGGER) as builder, \
++        with trt.Builder(logger=TRT_LOGGER) as builder, \
+                 builder.create_network(1) as network,\
+                 trt.OnnxParser(network, TRT_LOGGER) as parser:
+             
+@@ -36,15 +35,16 @@ def get_engine(max_batch_size=1, onnx_file_path="", engine_file_path="",\
+             print('Building an engine from file {}; this may take a while...'.format(onnx_file_path))        
+             
+             # build trt engine
+-            builder.max_batch_size = max_batch_size
+-            builder.max_workspace_size = 1 << 30 # 1GB
+-            builder.fp16_mode = fp16_mode
++            config = builder.create_builder_config()
++            config.max_workspace_size = 1 << 30 # 1GB
++            if fp16_mode:
++                config.set_flag(trt.BuilderFlag.FP16)
+             if int8_mode:
+-                builder.int8_mode = int8_mode
++                config.set_flag(trt.BuilderFlag.INT8)
+                 assert calibration_stream, 'Error: a calibration_stream should be provided for int8 mode'
+-                builder.int8_calibrator  = Calibrator(calibration_stream, calibration_table_path)
++                config.int8_calibrator  = Calibrator(calibration_stream, calibration_table_path)
+                 print('Int8 mode enabled')
+-            engine = builder.build_cuda_engine(network) 
++            engine = builder.build_engine(network, config)
+             if engine is None:
+                 print('Failed to create the engine')
+                 return None   
+-- 
+2.37.1 (Apple Git-137.1)
+
