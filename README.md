@@ -1,4 +1,4 @@
-# aicast_jetson_compare
+# aicast_jetson_benchmark
 
 Jetson Orin Nano / Jetson Nano / ai castでYOLOX-S-Leakyの比較
 
