@@ -2,8 +2,7 @@
 
 Benchmark YOLOX-S-Leaky on Jetson Nano, Jetson Orin Nano, and ai cast.
 
-TODO: NoteのURLをここに貼る
-Blog Post (Japanese): https://
+Blog Post (Japanese): [ai castの性能評価 (vs Jetson Orin Nano)](https://note.com/idein/n/n63728d3c107e)
 
 ## Environment
 - Jetson Orin Nano
